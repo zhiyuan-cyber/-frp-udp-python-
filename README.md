@@ -20,6 +20,8 @@
 | `cryptography` | 仅证书相关需要 | `pip install cryptography`。只在**生成/续期证书**时用到 |
 | `pyinstaller` | 仅打包 exe 需要 | `pip install pyinstaller`。只想跑起来的话不需要 |
 
+一次装齐（要打包或要证书自动续期时）：`pip install -r requirements.txt`
+
 **关键一点：本项目几乎没有第三方依赖。**
 界面（`ui_kit.py` 纯 Canvas 自绘）、托盘（`tray.py` ctypes 直调 Win32）、
 网络（`asyncio` + `ssl`）、日志与统计全部只用**标准库** ——
@@ -278,15 +280,18 @@ exe 是窗口程序、没有控制台，所以出问题时先看这个文件 —
 
 两种途径，任选其一：
 
-**A. 直接用打包好的**（见本仓库 Releases，或自行打包）
+**A. 直接用打包好的**（仓库里已带，克隆下来即可用）
 
 ```
-内网穿透助手.exe
+release/内网穿透助手.exe
 ```
+
+> 单文件、自包含，拷到任何 Windows 机器上双击即可，无需安装 Python。
 
 **B. 自己打包**（约 2 分钟）
 
 ```bash
+pip install -r requirements.txt   # 打包需要 pyinstaller + cryptography
 python build_exe.py
 # 产物：dist/内网穿透助手.exe
 ```

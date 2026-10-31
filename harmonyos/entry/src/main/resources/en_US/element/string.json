@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "FRP Helper mobile console"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "FRP Helper"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "FRP Helper"
+    },
+    {
+      "name": "reason_internet",
+      "value": "Connect to the FRP service on your computer to view status and logs"
+    },
+    {
+      "name": "reason_network_info",
+      "value": "Check network availability and show connection status"
+    }
+  ]
+}

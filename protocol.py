@@ -76,6 +76,7 @@ import logging
 import os
 import ssl
 import struct
+import threading
 import time
 
 logger = logging.getLogger("frp.protocol")
@@ -171,14 +172,55 @@ HANDSHAKE_TIMEOUT = 10
 USER_CONN_TIMEOUT = 30
 
 
+# ---------------------------------------------------------------------------
+# 日志统一配置
+# ---------------------------------------------------------------------------
+# 本项目用到的 logger 名字与层级（logging 是一棵树）：
+#
+#      root
+#       ├── gui              （界面自身）
+#       ├── frps  frpc  tray （独立 logger）
+#       └── frp              ← 父节点
+#            ├── frp.protocol
+#            ├── frp.cert
+#            └── frp.selector
+#
+# ★ 为什么只需要挂 root 一个地方？
+#    logging 默认 propagate=True：记录会从产生它的 logger 出发，
+#    沿 parent 链一路向上冒泡，**每个链条上带 handler 的 logger 都会处理它一次**。
+#    只要所有 logger 都保持 propagate=True，把 handler 全挂在 root 上，
+#    任何一条记录都恰好经过 root 一次 —— 不重不漏。
+#
+# ★ 反面教材（这个 bug 真踩过，实测复现）：同时给 root 和 "frp" 挂 handler。
+#    frp.cert 的记录会先被 "frp" 的 handler 处理，再被 root 的 handler 处理，
+#    于是**每行日志都出现两遍**（文件与界面里都是）。
+#    所以：handler 只挂 root，中间层的父 logger 一律不挂。
+NAMED_LOGGERS = ()      # 保留此常量以便将来需要给特殊 logger 单独挂 handler
+
+# 本项目实际会用到的 logger 名（用于统一把 propagate 置回 True、清掉历史残留 handler）。
+# 新增模块时把 logger 名加到这里，日志就能自动进界面与 7 天文件。
+PROJECT_LOGGERS = (
+    "gui", "tray", "frps", "frpc", "config", "netinfo", "rules",
+    "frp", "frp.protocol", "frp.cert", "frp.selector",
+)
+
+
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """创建一个格式统一的 logger，便于排查问题。
 
     异步程序一旦并发量上来，print 出来的输出会互相穿插、无法定位，
     所以统一走 logging，并在日志里带上时间、级别、模块名。
+
+    ★ handler 策略：
+      · 挂一个 StreamHandler 到**控制台** —— 保证命令行直接跑
+        （frps.py / frpc.py / 各 test_*.py）时能看见日志；
+      · **不清空也不关掉 propagate** —— 记录继续向上冒泡到 root，
+        于是 GUI 里 install_logging() 挂在 root 上的"界面队列 + 7 天文件"
+        handler 也能收到同一份日志。
+    这样命令行与图形界面两不耽误，且不会重复输出。
     """
     lg = logging.getLogger(name)
-    if not lg.handlers:  # 避免被重复调用时叠加 handler，导致日志打两遍
+    if not lg.handlers:     # 避免重复调用时叠加 handler，导致日志打两遍
         handler = logging.StreamHandler()
         handler.setFormatter(
             logging.Formatter(
@@ -187,9 +229,52 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
             )
         )
         lg.addHandler(handler)
-        lg.propagate = False
     lg.setLevel(level)
     return lg
+
+
+def install_logging(handlers, level: int = logging.INFO,
+                    named: "tuple[str, ...]" = NAMED_LOGGERS) -> None:
+    """把 handler 挂到 root，并确保所有相关 logger 都冒泡到 root（幂等）。
+
+    为什么要这么写：
+        项目里曾把各模块 logger 设成 propagate=False，再只往 root 挂
+        handler —— 结果 frps / frpc / tray / frp.* 的日志一条都到不了
+        handler，表现就是"文件里只有界面那几行、日志窗口一片空白"。
+        这正是最初"日志不显示"的根因。
+
+    解决办法（两个动作，缺一不可）：
+        1. 把所有 logger 的 propagate 恢复成 True —— 让记录能冒泡；
+        2. handler 只挂在 root 上 —— 保证每条记录只被处理一次。
+    绝不要给中间层父 logger（例如 "frp"）也挂 handler，
+    否则其子 logger 的记录会被处理两遍（实测过，日志每行重复）。
+
+    handlers 里的 handler 会被复用（同一实例），
+    因此写文件不会重复、界面也不会收到两份。
+    """
+    # 1) 让所有本项目用到的 logger 都能冒泡到 root
+    for name in PROJECT_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        lg.propagate = True
+        # 清掉可能残留的"重复根 handler"（早期版本在多个 logger 上挂过同一实例），
+        # 但**保留** get_logger() 给命令行准备的那个 StreamHandler ——
+        # 它只在控制台输出，跟 GUI 的文件/队列 handler 各管一路，不会重复。
+
+    # 2) handler 只挂 root
+    root = logging.getLogger()
+    root.setLevel(level)
+    for h in handlers:
+        if h not in root.handlers:
+            root.addHandler(h)
+
+    # 3) 额外指定的 logger（一般留空）另挂一份
+    for name in named:
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        for h in handlers:
+            if h not in lg.handlers:
+                lg.addHandler(h)
 
 
 def parse_log_level(text: str) -> int:
@@ -853,8 +938,16 @@ class Stats:
         self.started_at = time.time()
         self.connections_accepted = 0   # 累计接受的外部用户连接（TCP）
         self.connections_active = 0     # 当前正在转发的连接（TCP）
+        self.connections_peak = 0       # 活跃连接的历史峰值（界面上显示"峰值"）
         self.tunnels_established = 0    # 累计建立的隧道数
-        self.bytes_forwarded = 0        # 累计转发字节数
+        self.bytes_forwarded = 0        # 累计转发字节数（上下行合计）
+        # --- 方向性流量（界面上的 上传/下载）---
+        #   口径按"内网侧"的视角定义，和常见网络工具的习惯一致：
+        #     上行 up   = 内网 → 外网（内网服务把数据发出去，例如网页响应、上传文件）
+        #     下行 down = 外网 → 内网（外面进来的数据，例如请求、下载内容）
+        #   注意：不能简单用 tag 字符串去猜方向，所以由调用方显式传 direction。
+        self.bytes_up = 0
+        self.bytes_down = 0
         self.auth_failures = 0          # 鉴权失败次数
         self.rejected_overload = 0      # 因超限被拒次数
         self.rejected_timeout = 0       # 排队超时被拒次数
@@ -869,6 +962,38 @@ class Stats:
         # --- P2P 打洞 ---
         self.p2p_attempts = 0           # 累计打洞尝试次数
         self.p2p_success = 0            # 累计打洞成功次数
+        # --- 过滤规则 ---
+        self.rules_blocked = 0          # 被过滤规则拦下的转发请求数
+
+    # 界面上直接展示的计数字段（新增指标时改这里一处即可）
+    COUNTERS = (
+        "connections_accepted", "connections_active", "connections_peak",
+        "tunnels_established", "bytes_forwarded", "bytes_up", "bytes_down",
+        "auth_failures", "rejected_overload", "rejected_timeout",
+        "rejected_offline", "cert_renewals", "rules_blocked",
+        "udp_sessions_opened", "udp_sessions_active", "udp_datagrams",
+        "udp_bytes", "udp_rejected", "p2p_attempts", "p2p_success",
+    )
+
+    def snapshot(self) -> dict:
+        """给界面用的只读快照。
+
+        为什么要快照而不是直接读属性？
+            这些计数在「跑服务的那条事件循环线程」里写，
+            界面在主线程里读。虽然单个 int 的读写在 GIL 下是原子的、
+            不会读到半个值，但一次性取一组放在同一个 dict 里，
+            界面画出来的那一帧才是**自洽**的（不会出现上行是新的、
+            下行还是旧的这种别扭情况）。
+        """
+        snap = {name: getattr(self, name) for name in self.COUNTERS}
+        snap["started_at"] = self.started_at
+        snap["uptime"] = max(0.0, time.time() - self.started_at)
+        return snap
+
+    def note_active_peak(self) -> None:
+        """刷新活跃连接峰值（每次连接数变化后调一次）。"""
+        if self.connections_active > self.connections_peak:
+            self.connections_peak = self.connections_active
 
     def summary(self) -> str:
         """生成一行摘要，方便周期性打印或落盘。"""
@@ -885,19 +1010,155 @@ class Stats:
         return (
             f"运行 {uptime:.0f}s | 用户连接 累计{self.connections_accepted} 活跃{self.connections_active} "
             f"| 隧道 {self.tunnels_established} | 转发 {format_bytes(self.bytes_forwarded)} "
+            f"(↑{format_bytes(self.bytes_up)} ↓{format_bytes(self.bytes_down)}) "
             f"| 拒绝(超载{self.rejected_overload} 超时{self.rejected_timeout} 离线{self.rejected_offline}) "
             f"| 鉴权失败 {self.auth_failures} | 证书续期 {self.cert_renewals}"
+            + (f" | 规则拦截 {self.rules_blocked}" if self.rules_blocked else "")
             + udp + p2p
         )
 
 
 def format_bytes(n: int) -> str:
-    """把字节数转成人类可读的形式，如 1.5 MB。"""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+    """把字节数转成人类可读的形式，如 1.5 MB。
+
+    ★ 用 1024 进制，且单位固定两位有效（B 除外），
+      这样界面上的数字每帧宽度变化小，看起来不会"跳"。
+    """
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "0 B"
+    neg = n < 0
+    n = abs(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1024 or unit == "PB":
+            if unit == "B":
+                txt = "%d B" % int(n)
+            else:
+                txt = "%.1f %s" % (n, unit)
+            return ("-" + txt) if neg else txt
         n /= 1024.0
-    return f"{n} B"
+    return "0 B"
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    """把速率转成 "1.2 MB/s" 这种形式。"""
+    return format_bytes(max(0.0, bytes_per_sec)) + "/s"
+
+
+def format_duration(seconds: float) -> str:
+    """把秒数转成 3天02:15:07 / 02:15:07 这样的时长。"""
+    seconds = int(max(0, seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return "%d天%02d:%02d:%02d" % (d, h, m, s)
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
+def peer_text(writer: "asyncio.StreamWriter | None") -> str:
+    """取对端的 "ip:port" 文本（取不到就返回 ?，绝不抛异常）。"""
+    if writer is None:
+        return "?"
+    try:
+        p = writer.get_extra_info("peername")
+    except Exception:                   # noqa: BLE001
+        return "?"
+    if isinstance(p, tuple) and len(p) >= 2:
+        return "%s:%s" % (p[0], p[1])
+    return str(p) if p else "?"
+
+
+# ---------------------------------------------------------------------------
+# 连接台账：谁在用这条隧道
+# ---------------------------------------------------------------------------
+
+class ConnRecord:
+    """一条正在转发的连接的明细。
+
+    为什么需要它？
+        Stats 只给"总量"，界面上没法回答"现在是哪个程序、从哪个地址
+        在用我的隧道"。这条记录就是为这个问题准备的。
+    """
+
+    __slots__ = ("cid", "proxy", "peer", "target", "started",
+                 "bytes_up", "bytes_down", "p2p")
+
+    def __init__(self, cid: int, proxy: str, peer: str, target: str,
+                 p2p: bool = False):
+        self.cid = cid
+        self.proxy = proxy          # 代理名（多客户端时用来区分）
+        self.peer = peer            # 对端地址：服务端侧是外部用户 IP:端口
+        self.target = target        # 内网目标 host:端口（客户端侧才有意义）
+        self.started = time.time()
+        self.bytes_up = 0           # 本连接的上行字节
+        self.bytes_down = 0         # 本连接的下行字节
+        self.p2p = p2p              # 数据面是否走了 P2P 直连
+
+    def snapshot(self) -> dict:
+        return {
+            "cid": self.cid,
+            "proxy": self.proxy,
+            "peer": self.peer,
+            "target": self.target,
+            "started": self.started,
+            "elapsed": max(0.0, time.time() - self.started),
+            "bytes_up": self.bytes_up,
+            "bytes_down": self.bytes_down,
+            "bytes_total": self.bytes_up + self.bytes_down,
+            "p2p": self.p2p,
+        }
+
+
+class ConnRegistry:
+    """正在转发的连接台账。
+
+    线程安全说明：
+        台账在"跑事件循环的那条线程"里增删改，界面在主线程里读。
+        这里用一把小锁把两边隔开 —— 虽然只读快照本身不至于崩，
+        但 dict 在遍历中被改会抛 RuntimeError，加上锁最省心。
+    """
+
+    def __init__(self):
+        self._items: "dict[int, ConnRecord]" = {}
+        self._next = 1
+        self._lock = threading.Lock()
+        self.total_opened = 0           # 累计开启过的连接数（含已关闭的）
+
+    def open(self, proxy: str, peer: str, target: str, p2p: bool = False) -> ConnRecord:
+        with self._lock:
+            cid = self._next
+            self._next += 1
+            self.total_opened += 1
+            rec = ConnRecord(cid, proxy, peer, target, p2p)
+            self._items[cid] = rec
+            return rec
+
+    def close(self, rec: "ConnRecord | None") -> None:
+        if rec is None:
+            return
+        with self._lock:
+            self._items.pop(rec.cid, None)
+
+    def set_p2p(self, rec: "ConnRecord | None", value: bool) -> None:
+        if rec is not None:
+            rec.p2p = value
+
+    def snapshot(self) -> list:
+        """按开始时间排序的连接明细列表（新的在后）。"""
+        with self._lock:
+            return [r.snapshot() for r in
+                    sorted(self._items.values(), key=lambda r: r.cid)]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return len(self._items)
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1303,8 @@ async def stream_copy(
     tag: str = "",
     stats: "Stats | None" = None,
     idle_timeout: "float | None" = None,
+    direction: "str | None" = None,
+    conn: "ConnRecord | None" = None,
 ) -> None:
     """单向数据泵：从 reader 读，往 writer 写，直到某一端结束。
 
@@ -1066,6 +1329,13 @@ async def stream_copy(
           设为 None（默认）表示不做空闲检测，保持原行为 ——
           这样既能让隧道用上假死检测，又不影响"本来就该长时间安静"
           的场景（比如某些长轮询）。
+
+    可选参数 direction（"up" / "down"）：
+        用来分别累加 上行/下行 字节，供界面显示"上传/下载"。
+        口径以**内网侧**为准：
+            "up"   内网 → 外网（内网服务把数据发出去）
+            "down" 外网 → 内网（外面进来的数据）
+        传 None 表示只计入合计、不分方向。
     """
     try:
         while True:
@@ -1086,6 +1356,18 @@ async def stream_copy(
             await writer.drain()  # 背压控制点，缺了它大流量下会 OOM
             if stats is not None:
                 stats.bytes_forwarded += len(data)
+                # 方向性统计：direction 由调用方显式给出，不从 tag 文本猜
+                # （tag 是给人看的日志，随时可能改文案，不该承载语义）
+                if direction == "up":
+                    stats.bytes_up += len(data)
+                elif direction == "down":
+                    stats.bytes_down += len(data)
+            # 连接明细：界面上"谁在用隧道"的每一行就靠这两个计数
+            if conn is not None:
+                if direction == "up":
+                    conn.bytes_up += len(data)
+                elif direction == "down":
+                    conn.bytes_down += len(data)
     except asyncio.CancelledError:
         # 任务被主动取消（正常收尾流程），不属于错误，直接向上抛
         raise

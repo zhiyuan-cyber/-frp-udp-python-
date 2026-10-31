@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "内网穿透助手手机控制端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "内网穿透助手"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "内网穿透助手"
+    },
+    {
+      "name": "reason_internet",
+      "value": "用于连接电脑上的内网穿透服务，查看状态与日志"
+    },
+    {
+      "name": "reason_network_info",
+      "value": "用于判断当前网络是否可用，提示连接状态"
+    }
+  ]
+}

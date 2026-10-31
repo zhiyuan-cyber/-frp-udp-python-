@@ -1,0 +1,52 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#101418"
+    },
+    {
+      "name": "app_bg",
+      "value": "#101418"
+    },
+    {
+      "name": "card_bg",
+      "value": "#1A2028"
+    },
+    {
+      "name": "card_bg_soft",
+      "value": "#222A34"
+    },
+    {
+      "name": "text_primary",
+      "value": "#E8EDF4"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#9AA7B8"
+    },
+    {
+      "name": "text_muted",
+      "value": "#6B7785"
+    },
+    {
+      "name": "accent",
+      "value": "#4C8DFF"
+    },
+    {
+      "name": "ok",
+      "value": "#3FBF7F"
+    },
+    {
+      "name": "warn",
+      "value": "#E3B341"
+    },
+    {
+      "name": "danger",
+      "value": "#FF7B72"
+    },
+    {
+      "name": "border",
+      "value": "#2A333F"
+    }
+  ]
+}

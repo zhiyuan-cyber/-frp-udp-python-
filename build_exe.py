@@ -46,13 +46,20 @@ DIST = os.path.join(HERE, "dist")
 BUILD = os.path.join(HERE, "build")
 VERSION_FILE = os.path.join(HERE, "version_info.txt")
 
+# 程序图标：.ico 给 exe（资源管理器/桌面/任务栏），.png 给运行期窗口用
+ICON_ICO = os.path.join(HERE, "assets", "icon.ico")
+ICON_PNG = os.path.join(HERE, "assets", "icon.png")
+
 # 这些模块必须显式声明，因为它们是"运行期才 import"的，
 # PyInstaller 的静态分析看不到（gui.py 里用 import frps / import frpc 延迟导入）。
 HIDDEN = [
     "frps", "frpc", "protocol", "config", "gen_cert", "cert_renew", "about",
+    "rules", "netinfo", "ui_kit", "tray",   # 规则 / 服务器信息 / 界面组件 / 托盘
     "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
     "cryptography", "cryptography.hazmat.backends.openssl",
     "asyncio", "ssl", "sqlite3",
+    # netinfo 用标准库联网查 IP 归属地，这几个模块必须带上
+    "urllib.request", "urllib.error", "ipaddress",
 ]
 
 # 明确排除，给 exe 瘦身（这些是本机其他项目用的，跟本程序无关）
@@ -62,8 +69,15 @@ EXCLUDE = [
     "scipy", "lxml", "bs4", "requests",
 ]
 
-# 打包时留在 exe 旁边、方便用户查看的文件（可选）
-BUNDLE_EXTRAS = ["README.md"]
+# 需要一并打包进 exe 的资源：(源文件, 包内目录)
+#   这些文件会被打进 exe，运行时解压到临时目录（sys._MEIPASS）供程序读取。
+#   · icon.ico / icon.png —— 由 gui.apply_window_icon() 读取，用于窗口与任务栏图标
+#   · README.md            —— 顺手带上，方便随 exe 分发
+BUNDLE_EXTRAS = [
+    (ICON_ICO, "assets"),
+    (ICON_PNG, "assets"),
+    (os.path.join(HERE, "README.md"), "."),
+]
 
 
 def check_env() -> None:
@@ -178,6 +192,13 @@ def build() -> None:
 
     vfile = write_version_file()
 
+    # 图标检查：缺了就打不出带图标的 exe，提前给出可读提示
+    if not os.path.exists(ICON_ICO):
+        sys.stderr.write(
+            "缺少图标文件：%s\n"
+            "请先运行 python make_icon.py 从源图生成 assets/icon.ico。\n" % ICON_ICO)
+        raise SystemExit(1)
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -191,15 +212,18 @@ def build() -> None:
         "--paths", HERE,
         # ★ 作者信息写进 exe 文件属性
         "--version-file", vfile,
+        # ★ 程序图标：写进 PE 资源，决定桌面 / 资源管理器 / 任务栏显示的图标
+        "--icon", ICON_ICO,
     ]
     for h in HIDDEN:
         cmd += ["--hidden-import", h]
     for e in EXCLUDE:
         cmd += ["--exclude-module", e]
-    for x in BUNDLE_EXTRAS:
-        p = os.path.join(HERE, x)
-        if os.path.exists(p):
-            cmd += ["--add-data", "%s%s." % (p, os.pathsep)]
+    for src, dest in BUNDLE_EXTRAS:
+        if os.path.exists(src):
+            cmd += ["--add-data", "%s%s%s" % (src, os.pathsep, dest)]
+        else:
+            print("  · 跳过缺失的资源：%s" % src)
     cmd.append(ENTRY)
 
     print("开始打包（首次较慢，请耐心等待）……")
@@ -214,9 +238,10 @@ def build() -> None:
         raise SystemExit(1)
     size_mb = os.path.getsize(exe) / 1024 / 1024
     print("\n打包完成：%s（%.1f MB）" % (exe, size_mb))
-    print("作者信息已写入：")
-    print("  · 程序界面底部署名 + 「帮助 → 关于」对话框")
-    print("  · exe 文件属性（右键 → 属性 → 详细信息）")
+    print("已写入：")
+    print("  · 程序图标（桌面/资源管理器/任务栏）  ← assets/icon.ico")
+    print("  · 作者信息（界面署名 + 「帮助 → 关于」对话框）")
+    print("  · 作者信息（exe 属性：右键 → 属性 → 详细信息）")
     print("    %s" % about.summary())
     print("提示：dist/ 内的 certs/ 与 tokens.txt 属于运行时凭据，本次未做任何改动。")
 

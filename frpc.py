@@ -32,6 +32,7 @@ import socket
 
 from config import add_common_args, attach_config, remember_defaults
 import about  # 作者/程序信息集中在这里（改 about.py 全项目生效）
+from rules import RuleSet  # 转发过滤规则（限制哪些内网目标不允许被穿透）
 from protocol import (
     DATA_IDLE_TIMEOUT,
     HEARTBEAT_INTERVAL,
@@ -54,6 +55,7 @@ from protocol import (
     cancel_task,
     client_authenticate,
     close_writer,
+    ConnRegistry,
     decode_p2p_info,
     decode_udp_assoc,
     encode_udp_close,
@@ -61,6 +63,7 @@ from protocol import (
     get_logger,
     parse_log_level,
     parse_token_spec,
+    peer_text,
     read_cmd,
     read_udp_data,
     send_register,
@@ -264,6 +267,8 @@ class Frpc:
     def __init__(self, args):
         self.args = args
         self.stats = Stats()
+        # 正在转发的连接台账（界面「谁在用隧道」用）
+        self.connections = ConnRegistry()
         # 用 getattr 取这几个开关：让本类也能被"只填了必要字段"的
         # 调用方（如测试脚本、嵌入式用法）直接实例化，不必凑齐所有属性。
         self.ssl_ctx = build_client_ssl_context(
@@ -277,6 +282,11 @@ class Frpc:
             token_file=getattr(args, "token_file", ""),
         )
         self.proxy_name = getattr(args, "proxy_name", "") or socket.gethostname()
+        # 转发过滤规则：没配置时是空规则集（默认放行一切，保持向后兼容）。
+        # 注意这里只是拿到同一个 RuleSet 对象的引用 —— 界面上改规则后
+        # 对**后续新建的隧道**立即生效，已经建好的连接不受影响（合理：
+        # 半路掐断正在传数据的连接比让它传完更糟）。
+        self.rules = getattr(args, "rules", None) or RuleSet()
         # 当前控制连接对应的 UDP 转发器（没启用 UDP 时保持 None）
         self.udp_client: "UdpClient | None" = None
 
@@ -378,6 +388,19 @@ class Frpc:
             # 声明这条隧道属于哪个客户端 —— 服务端据此路由到正确的 Session
             await send_tunnel_ack(serve_writer, self.proxy_name)
 
+            # ★ 过滤规则：必须在连内网目标**之前**判定。
+            #   被拦时直接回绝，连一次 TCP 握手都不发生 ——
+            #   否则内网那台机器上仍会留下"被探测过"的连接记录。
+            allowed, why = self.rules.check(self.args.local_host,
+                                            self.args.local_port)
+            if not allowed:
+                self.stats.rules_blocked += 1
+                logger.warning("[%s] 转发被过滤规则拒绝：%s:%s —— %s",
+                               self.proxy_name, self.args.local_host,
+                               self.args.local_port, why)
+                await close_writer(serve_writer)
+                return
+
             local_reader, local_writer = await asyncio.open_connection(
                 self.args.local_host, self.args.local_port
             )
@@ -388,6 +411,15 @@ class Frpc:
 
         self.stats.tunnels_established += 1
         self.stats.connections_active += 1
+        self.stats.note_active_peak()
+
+        # 登记到连接台账：客户端这边知道真实的内网目标，
+        # 所以「谁在用隧道」在客户端视角下能看到具体是哪个服务。
+        rec = self.connections.open(
+            self.proxy_name,
+            peer_text(serve_writer),
+            "%s:%s" % (self.args.local_host, self.args.local_port))
+
         logger.info("[%s] 隧道已建立：服务端 ⇄ %s:%s",
                     self.proxy_name, self.args.local_host, self.args.local_port)
         try:
@@ -395,12 +427,16 @@ class Frpc:
                 # ★ idle_timeout：数据隧道没法靠心跳字节保活（会污染用户数据），
                 #   只能靠"长期收不到数据 = 连接已死"来兜住 TCP 半开。
                 #   取一个较宽松的值，正常业务几乎不会触发。
+                # direction：外网→内网 算"下行"，内网→外网 算"上行"
                 stream_copy(serve_reader, local_writer, "外网→本地", self.stats,
-                            idle_timeout=DATA_IDLE_TIMEOUT),
+                            idle_timeout=DATA_IDLE_TIMEOUT, direction="down",
+                            conn=rec),
                 stream_copy(local_reader, serve_writer, "本地→外网", self.stats,
-                            idle_timeout=DATA_IDLE_TIMEOUT),
+                            idle_timeout=DATA_IDLE_TIMEOUT, direction="up",
+                            conn=rec),
             )
         finally:
+            self.connections.close(rec)
             self.stats.connections_active -= 1
             logger.info("[%s] 隧道关闭", self.proxy_name)
 

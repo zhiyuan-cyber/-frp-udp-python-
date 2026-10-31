@@ -59,6 +59,7 @@ from protocol import (
     cancel_task,
     cert_days_left,
     close_writer,
+    ConnRegistry,
     decode_udp_close,
     encode_p2p_info,
     encode_udp_assoc,
@@ -67,6 +68,7 @@ from protocol import (
     get_logger,
     parse_log_level,
     parse_token_spec,
+    peer_text,
     read_cmd,
     read_register,
     read_tunnel_ack,
@@ -440,6 +442,8 @@ class Frps:
     def __init__(self, args):
         self.args = args
         self.stats = Stats()
+        # 正在转发的连接台账（界面「谁在用隧道」用）
+        self.connections = ConnRegistry()
         # 统一用 getattr 取配置：既让"只填必要字段"的调用方（测试脚本、
         # 嵌入式用法）能直接实例化，也让新增参数不会破坏老调用代码。
         g = lambda k, d=None: getattr(args, k, d)
@@ -685,15 +689,27 @@ class Frps:
 
         self.stats.tunnels_established += 1
         self.stats.connections_active += 1
+        self.stats.note_active_peak()
+
+        # 登记到连接台账：界面上"谁在用隧道"的每一行
+        # 说明：服务端不知道客户端的内网目标（客户端不会上报自己的内网地址），
+        #       所以这里只填对端地址；内网目标要到"客户端视角"里才看得到。
+        rec = self.connections.open(name, peer_text(user_writer), "（内网侧）")
+
         logger.info("[%s] 隧道建立，开始转发数据（%s）", name, self.limiter.snapshot)
         try:
             await asyncio.gather(
+                # direction：外网用户 → 内网，属于"下行"（外面进来的数据）
                 stream_copy(user_reader, writer, f"{name}:用户→内网", self.stats,
-                            idle_timeout=DATA_IDLE_TIMEOUT),
+                            idle_timeout=DATA_IDLE_TIMEOUT, direction="down",
+                            conn=rec),
+                # 内网 → 外网用户，属于"上行"
                 stream_copy(reader, user_writer, f"{name}:内网→用户", self.stats,
-                            idle_timeout=DATA_IDLE_TIMEOUT),
+                            idle_timeout=DATA_IDLE_TIMEOUT, direction="up",
+                            conn=rec),
             )
         finally:
+            self.connections.close(rec)
             self.stats.connections_active -= 1
             self.limiter.active_release()
             logger.info("[%s] 隧道关闭（%s）", name, self.limiter.snapshot)

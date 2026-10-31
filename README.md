@@ -287,6 +287,10 @@ release/内网穿透助手.exe
 ```
 
 > 单文件、自包含，拷到任何 Windows 机器上双击即可，无需安装 Python。
+>
+> 也可以从 [Releases · v1.0.0](https://github.com/zhiyuan-cyber/-frp-udp-python-/releases/tag/v1.0.0)
+> 下载附件 `frp-gui-v1.0.0-x64.exe`（GitHub 附件名不支持中文，下载后改回
+> `内网穿透助手.exe` 即可），内容与 `release/` 里的完全一致（SHA256 相同）。
 
 **B. 自己打包**（约 2 分钟）
 

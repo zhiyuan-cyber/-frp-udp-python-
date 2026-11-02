@@ -157,17 +157,58 @@ def install_gui_logging(log_queue: "queue.Queue[tuple[str, str]]") -> None:
 # ======================================================================
 # 二、证书与 token 准备
 # ======================================================================
-def generate_certs(out_dir: str, hosts: list) -> None:
-    """生成一套自签证书，函数名与 gen_cert.py 的构件一一对应。
+def _split_hosts(text: str) -> "list[str]":
+    """把用户输入的一串地址拆成列表。
 
-    为什么不直接调 gen_cert.main()？
-        它是 argparse 入口（会解析 sys.argv 并 print 一堆说明），
-        在 GUI 里调用会把命令行参数误当成证书参数，也会污染输出。
-        这里直接用它暴露的构件函数，行为完全一致但不碰命令行。
+    逗号、中文逗号、分号、空格、换行随便用 —— 用户不该为分隔符记规则。
+    """
+    out = []
+    normalized = (str(text or "")
+                  .replace("，", ",").replace("；", ";").replace(";", ","))
+    for chunk in normalized.split(","):
+        for part in chunk.split():
+            h = part.strip()
+            if h and h not in out:
+                out.append(h)
+    return out
+
+
+def _cert_hosts(extra=None) -> "list[str]":
+    """证书里始终要覆盖的地址 = 用户填的地址 + 本机回环。
+
+    为什么固定带上 localhost / 127.0.0.1？
+      自检（--selftest）、同机调试、以及"服务端与客户端在同一台机器"
+      这几种情况都靠 127.0.0.1 连接。漏了它们，自检会直接失败。
+    """
+    hosts = []
+    for h in list(extra or []) + ["localhost", "127.0.0.1"]:
+        h = (h or "").strip()
+        if h and h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+def generate_certs(out_dir: str, hosts: list, reuse_ca: bool = True,
+                   log=print) -> None:
+    """生成一套自签证书；reuse_ca=True 时沿用目录里已有的 CA。
+
+    ★ 为什么重签要复用 CA？
+      客户端手里只认 ca.crt。如果每改一次证书就新建一个 CA，
+      所有客户端都得重新导入连接包 —— 换个 IP 就要全场换钥匙。
+      复用 CA 则只换服务端证书，客户端无感，这才叫"能改"。
     """
     import gen_cert
     os.makedirs(out_dir, exist_ok=True)
-    ca_key, ca_cert = gen_cert.build_ca()
+
+    ca_key = ca_cert = None
+    if reuse_ca:
+        ca_key, ca_cert = gen_cert.load_ca(
+            os.path.join(out_dir, "ca.crt"),
+            os.path.join(out_dir, "ca.key"))
+    if ca_key is None or ca_cert is None:
+        ca_key, ca_cert = gen_cert.build_ca()
+        log("已新建 CA：客户端需要重新导入连接包，才能校验新证书")
+
     srv_key, srv_cert = gen_cert.build_server_cert(ca_key, ca_cert, hosts)
     gen_cert.write_pem(os.path.join(out_dir, "ca.crt"), ca_cert)
     gen_cert.write_pem(os.path.join(out_dir, "ca.key"), None,
@@ -177,20 +218,54 @@ def generate_certs(out_dir: str, hosts: list) -> None:
                        key=srv_key, key_only=True)
 
 
-def ensure_certs(host: str, out_dir: str, log=print) -> bool:
-    """确保 certs/ 下有可用证书；缺了就现生成一套。"""
+def ensure_certs(hosts, out_dir: str, log=print, force: bool = False) -> bool:
+    """确保证书存在且 SAN 覆盖所需地址；不满足就（复用 CA）重签。
+
+    ★ 这是本次修复的核心之一。
+      旧实现只检查"三个文件在不在"，在就跳过。于是：
+        · 服务端证书里只有 localhost → 客户端拿公网 IP 连，主机名必然不匹配；
+        · 用户改了公网 IP → 程序仍认为"证书已存在"，永远不重签；
+        · 客户端模式还会顺手造一套没用的服务端证书，成为排查时的烟雾弹。
+      现在改为比对 SAN：缺哪个地址就补签，CA 保持不变。
+    """
+    if isinstance(hosts, str):
+        hosts = [hosts]
+    hosts = _cert_hosts(hosts)
+
     crt = os.path.join(out_dir, "server.crt")
     key = os.path.join(out_dir, "server.key")
     ca = os.path.join(out_dir, "ca.crt")
-    if all(os.path.exists(p) for p in (crt, key, ca)):
-        return True
+    complete = all(os.path.exists(p) for p in (crt, key, ca))
+
+    if complete and not force:
+        import gen_cert
+        if gen_cert.cert_covers(crt, hosts):
+            return True
+        log("服务端证书未覆盖 %s，自动重签服务端证书"
+            "（CA 不变，客户端无需更换 ca.crt）", "、".join(hosts))
+
     try:
-        generate_certs(out_dir, hosts=[host, "localhost", "127.0.0.1"])
+        generate_certs(out_dir, hosts, reuse_ca=True, log=log)
     except Exception as exc:            # noqa: BLE001
         log("生成证书失败：%s", exc)
         return False
-    log("证书已生成：%s", out_dir)
+    log("证书已就绪：%s（登记地址：%s）", out_dir, "、".join(hosts))
     return True
+
+
+def ensure_client_ca(out_dir: str, log=print) -> bool:
+    """客户端侧只检查 ca.crt 是否就位，绝不生成服务端证书。
+
+    ★ 旧版客户端启动时会 ensure_certs(服务器地址)，在本机生成一套
+      "看起来完全正确"的 server.crt / server.key。可客户端根本用不上它们
+      （校验只认 ca.crt），却会让人误以为证书没问题 —— 排查时最误导人的
+      就是这种东西。缺失时应当明确提示去"导入连接包"。
+    """
+    ca = os.path.join(out_dir, "ca.crt")
+    if os.path.exists(ca):
+        return True
+    log("客户端缺少 ca.crt：请先用「导入连接包」导入服务端导出的包")
+    return False
 
 
 def ensure_token(path: str, log=print) -> str:
@@ -807,10 +882,14 @@ class App(tk.Tk):
 
         self.sv_port = tk.StringVar(value="8800")
         self.sv_user_host = tk.StringVar(value="0.0.0.0")
+        self.sv_cert_host = tk.StringVar(value="")
         self.sv_level = tk.StringVar(value="INFO")
         _field(card.body, "控制端口", self.sv_port, "供内网客户端连接（默认 8800）")
         _field(card.body, "对外监听地址", self.sv_user_host,
                "一般留 0.0.0.0 表示所有网卡")
+        _field(card.body, "对外访问地址", self.sv_cert_host,
+               "客户端连你时用的公网 IP 或域名（写进证书），可填多个、空格分隔；"
+               "留空则只登记 localhost")
         _field(card.body, "日志级别", self.sv_level,
                "DEBUG / INFO / WARNING / ERROR")
 
@@ -826,6 +905,8 @@ class App(tk.Tk):
 
         _section(card.body, "首次启动会做什么")
         _bullet(card.body, "自动生成一套自签证书（certs/）与随机 token（tokens.txt）")
+        _bullet(card.body, "证书里会写入上面填的「对外访问地址」；"
+                           "地址变了会自动重签（CA 不变，客户端不用换包）")
         _bullet(card.body, "证书有效期 1 年，到期前自动续期（需 ca.key 在位）")
         _bullet(card.body, "点「导出连接包」把 ca.crt + token 打成 zip，"
                            "拷到内网机器导入即可")
@@ -850,6 +931,16 @@ class App(tk.Tk):
                              % (days, "" if days > 30 else "（即将到期，会自动续期）"))
             else:
                 parts.append("服务端证书：已存在（有效期读取失败）")
+            # 把 SAN 亮出来：客户端连不上时，第一个要看的就是这里有没有那个地址。
+            try:
+                import gen_cert
+                san = gen_cert.cert_san_hosts(crt)
+            except Exception:           # noqa: BLE001
+                san = []
+            if san:
+                parts.append("证书登记地址：%s" % "、".join(san))
+            else:
+                parts.append("证书登记地址：读取失败")
         else:
             parts.append("服务端证书：尚未生成（启动服务端时自动创建）")
         parts.append("数据目录：%s" % DATA_DIR)
@@ -885,6 +976,21 @@ class App(tk.Tk):
         _field(card.body, "对外端口", self.cl_remote_port, "外部访问时用的端口，如 9001")
         _field(card.body, "客户端名字", self.cl_name, "多客户端时须唯一，建议按用途命名")
         _field(card.body, "UDP 对外端口", self.cl_udp, "可选，填了才转发 UDP")
+
+        # —— 证书主机名校验 ——
+        # 默认关闭：服务端多在云主机上，公网 IP 是 NAT 映射、网卡上看不到，
+        # 证书里往往只有 localhost。开启严格校验必然握手失败。
+        # 关闭后仍然校验证书链（CA），只是不比对"证书里的地址"与"你连接的地址"。
+        self.cl_strict_host = tk.BooleanVar(value=False)
+        srow = tk.Frame(card.body, bg=uk.BG_CARD)
+        srow.pack(fill="x", pady=(10, 0))
+        tk.Label(srow, text="严格校验证书主机名", font=uk.ui_font(10),
+                 bg=uk.BG_CARD, fg=uk.TEXT_SUB, width=12,
+                 anchor="e").pack(side="left")
+        uk.make_switch(srow, self.cl_strict_host).pack(side="left", padx=(8, 10))
+        tk.Label(srow, text="关闭时仍校验 CA 链，只跳过「证书地址 vs 连接地址」比对",
+                 font=uk.ui_font(9), bg=uk.BG_CARD,
+                 fg=uk.TEXT_MUTED).pack(side="left")
 
         btns = tk.Frame(card.body, bg=uk.BG_CARD)
         btns.pack(fill="x", pady=(14, 0))
@@ -1971,13 +2077,21 @@ class App(tk.Tk):
             return
         host = self.sv_user_host.get().strip() or "0.0.0.0"
         level = self.sv_level.get().strip().upper() or "INFO"
+        # 用户在「对外访问地址」里填的公网 IP / 域名：它们会被写进证书 SAN，
+        # 同时传给服务端做自动续期，避免续期后 SAN 退回 localhost。
+        cert_hosts = _split_hosts(self.sv_cert_host.get())
 
-        if not ensure_certs("localhost", CERT_DIR, log=LOG.info):
+        if not ensure_certs(cert_hosts, CERT_DIR, log=LOG.info):
             messagebox.showerror(
                 "证书生成失败",
                 "无法生成自签证书，请确认已安装 cryptography。\n"
                 "（打包版已内置，源码运行需 pip install cryptography）")
             return
+        if not cert_hosts:
+            LOG.warning(
+                "未填写「对外访问地址」：证书里只登记了 localhost/127.0.0.1。"
+                "客户端若用公网 IP 连接，严格主机名校验会失败 —— "
+                "建议填上公网 IP 或域名后重启服务端。")
         ensure_token(TOKEN_FILE, log=LOG.info)
 
         args = _Namespace(
@@ -1987,7 +2101,7 @@ class App(tk.Tk):
             key_file=os.path.join(CERT_DIR, "server.key"),
             ca_cert_file=os.path.join(CERT_DIR, "ca.crt"),
             ca_key_file=os.path.join(CERT_DIR, "ca.key"),
-            cert_host=[], cert_renew_days=30,
+            cert_host=_cert_hosts(cert_hosts), cert_renew_days=30,
             max_conn_per_ip=20, max_active_conns=100, max_queued=50,
             udp_target_addr="", max_udp_sessions=512, udp_session_timeout=60,
             enable_p2p=True,
@@ -2049,10 +2163,23 @@ class App(tk.Tk):
                     % (local_host, local_port, why)):
                 return
 
-        if not ensure_certs(host, CERT_DIR, log=LOG.info):
-            messagebox.showerror("证书生成失败", "无法生成自签证书。")
+        # 客户端只认 ca.crt —— 不再在这里生成服务端证书（旧版会生成，
+        # 那套证书对连接毫无用处，却会让人误以为"证书没问题"）。
+        if not ensure_client_ca(CERT_DIR, log=LOG.info):
+            messagebox.showerror(
+                "缺少 CA 证书",
+                "本机还没有 ca.crt，无法校验服务端身份。\n\n"
+                "请在服务端点「导出连接包」，再回到这里点「导入连接包」。")
             return
         ensure_token(TOKEN_FILE, log=LOG.info)
+
+        strict = bool(self.cl_strict_host.get())
+        if strict:
+            LOG.info("已开启严格主机名校验：若服务端证书里没有登记 %s，"
+                     "握手会在 TLS 阶段失败（可在服务端「对外访问地址」里补上）", host)
+        else:
+            LOG.info("已关闭主机名校验（仍校验 CA 链）："
+                     "适用于服务端使用自签证书、通过公网 IP 访问的场景")
 
         args = _Namespace(
             serve_host=host, serve_port=port,
@@ -2064,6 +2191,7 @@ class App(tk.Tk):
             token="", token_file=TOKEN_FILE,
             ca_file=os.path.join(CERT_DIR, "ca.crt"),
             insecure=False, no_tls=False,
+            no_verify_hostname=not strict,
             rules=self.rules,       # 同一个对象：界面上改规则后新建隧道即生效
             log_level=self.cl_level.get().strip().upper() or "INFO",
         )
@@ -2145,6 +2273,7 @@ class App(tk.Tk):
             messagebox.showerror("无法读取", "这不是一个有效的 ZIP 包。")
             return
         LOG.info("已导入连接包：%s", path)
+        self._refresh_cert_info()
         messagebox.showinfo("导入成功",
                             "已导入 CA 证书与 token。\n"
                             "接下来填写「本机服务端口」与「对外端口」即可启动。")
@@ -2311,7 +2440,7 @@ async def _selftest() -> int:
         key_file=os.path.join(cert_dir, "server.key"),
         ca_cert_file=os.path.join(cert_dir, "ca.crt"),
         ca_key_file=os.path.join(cert_dir, "ca.key"),
-        cert_host=["localhost"], cert_renew_days=30,
+        cert_host=["localhost", "127.0.0.1"], cert_renew_days=30,
         max_conn_per_ip=20, max_active_conns=100, max_queued=50,
         udp_target_addr="", max_udp_sessions=512, udp_session_timeout=60,
         enable_p2p=False, log_level="ERROR",

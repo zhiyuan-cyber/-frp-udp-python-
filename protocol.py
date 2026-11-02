@@ -168,6 +168,11 @@ RECONNECT_JITTER = 0.3
 # 握手（鉴权 + 注册）超时：防止恶意连接占着不放。
 HANDSHAKE_TIMEOUT = 10
 
+# 读注册报文里"可选 UDP 端口"的试探超时（秒）。
+# ★ 为什么必须远小于 HANDSHAKE_TIMEOUT：不发 UDP 的客户端不会写这 2 字节，
+#   用 10 秒去试探等于每接入一个客户端就白白阻塞 10 秒。详见 read_register。
+REGISTER_UDP_PROBE_TIMEOUT = 0.5
+
 # 用户连接在队列里等待被服务的最长时间（秒），超时即断开。
 USER_CONN_TIMEOUT = 30
 
@@ -539,10 +544,19 @@ async def read_register(reader) -> "tuple[str, int, int]":
     # UDP 端口是可选字段：尝试读，读不到（老客户端 / 对端已发完）就算没有。
     # ★ 不能直接 readexactly 然后容错为 0 —— 那样会把"老客户端"误判成
     #   "连接中断"。这里用一个短超时试探性读取，拿不到就当 0。
+    #
+    # ★★ 这里**绝不能**用 HANDSHAKE_TIMEOUT（10 秒）★★
+    #   客户端 encode_register 在 udp_port=0 时压根不写这 2 个字节（见该函数
+    #   的兼容性说明），所以"没有 UDP"是绝大多数客户端的正常情况。
+    #   一旦用 10 秒超时去试探，服务端每接入一个客户端就要干等满 10 秒：
+    #   日志表现为"客户端早已连上并说已注册，服务端 10 秒后才打印已接入"，
+    #   期间控制连接处于半挂起状态，外部用户连进来只能排队。
+    #   注册报文是一次 write 写出去的整体，后续 2 字节若存在必然同时到达，
+    #   所以 0.5 秒足够区分"有"和"没有"。
     udp_port = 0
     try:
         raw_udp = await asyncio.wait_for(
-            reader.readexactly(PORT_SIZE), timeout=HANDSHAKE_TIMEOUT
+            reader.readexactly(PORT_SIZE), timeout=REGISTER_UDP_PROBE_TIMEOUT
         )
         udp_port = struct.unpack("!H", raw_udp)[0]
     except (asyncio.TimeoutError, asyncio.IncompleteReadError):
@@ -869,17 +883,39 @@ def build_server_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
 
 
 def build_client_ssl_context(
-    ca_file: str = "", insecure: bool = False, no_tls: bool = False
+    ca_file: str = "",
+    insecure: bool = False,
+    no_tls: bool = False,
+    verify_hostname: bool = True,
 ) -> "ssl.SSLContext | None":
     """构造客户端 SSL 上下文。
 
     三种模式（按优先级）：
       · no_tls=True          → 返回 None，表示完全不用 TLS（明文）。
                                仅当服务端也没配证书时才这么用，否则会握手失败。
-      · ca_file 指定 CA 证书 → 严格校验服务端身份（生产环境应如此）
+      · ca_file 指定 CA 证书 → 校验服务端身份（生产环境应如此）
       · insecure=True        → 不校验（仅用于自签证书的临时测试）
 
     三者都不满足时直接报错，避免用户"以为加密了其实没有"。
+
+    ★ verify_hostname（仅 ca_file 模式生效，默认 True = 原有行为）
+      当它为 False 时：**仍然校验证书链（CERT_REQUIRED），但不再比对
+      证书 SAN 与连接地址**。
+
+      为什么需要这一档？—— 自签证书部署在公网 IP 上的真实困境：
+      服务端证书的主机名是签发那一刻写死的，而云主机的公网 IP 往往是
+      EIP/NAT 映射，本机网卡上根本看不到（只有 10.x 私网地址）。
+      服务端程序无法自动得知自己的公网 IP，于是证书里只能写 localhost；
+      客户端拿 1.2.3.4 去连，主机名必然不匹配，握手在 TLS 阶段就被拒。
+
+      此时只有两个选择：要么让用户在服务端手工填对公网 IP 并重签证书，
+      要么允许"只校验 CA、不校验主机名"。后者在自签场景下是常见做法：
+      中间人仍然无法伪造证书（没有 CA 私钥就签不出来），
+      只是失去了"这张证书是不是专门签给这个地址"的额外保证。
+
+      所以这里既不默认关闭（不能默默降低安全性），也不强制开启
+      （否则自签 IP 部署根本连不上），而是交给调用方显式决定，
+      并且每次关闭都在日志里留下一条 WARNING。
     """
     if no_tls:
         logger.warning("已禁用 TLS（--no_tls），本次为明文传输")
@@ -894,8 +930,18 @@ def build_client_ssl_context(
         logger.warning("已关闭证书校验（insecure 模式），仅建议在测试环境使用")
     elif ca_file:
         ctx.load_verify_locations(cafile=ca_file)
+        # 注意顺序：PROTOCOL_TLS_CLIENT 下 verify_mode 与 check_hostname
+        # 有联动约束，先定 verify_mode 再改 check_hostname 最稳。
         ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = True
+        if verify_hostname:
+            ctx.check_hostname = True
+        else:
+            ctx.check_hostname = False
+            logger.warning(
+                "已开启「仅校验 CA、不校验主机名」模式："
+                "证书链仍会验证，但不再比对证书里的地址与当前连接地址。"
+                "适用于服务端用自签证书、且通过公网 IP / NAT 地址访问的场景。"
+            )
     else:
         raise ValueError("必须提供 --ca_file，或显式指定 --insecure / --no_tls")
 

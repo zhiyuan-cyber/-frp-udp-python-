@@ -29,6 +29,7 @@ import contextlib
 import logging
 import os
 import socket
+import ssl
 
 from config import add_common_args, attach_config, remember_defaults
 import about  # 作者/程序信息集中在这里（改 about.py 全项目生效）
@@ -275,6 +276,8 @@ class Frpc:
             ca_file=getattr(args, "ca_file", ""),
             insecure=getattr(args, "insecure", False),
             no_tls=getattr(args, "no_tls", False),
+            # 缺省保持"严格校验主机名"，只有显式传 --no_verify_hostname 才放宽
+            verify_hostname=not getattr(args, "no_verify_hostname", False),
         )
         # token 也从文件读，且支持热重载 —— 轮换时不用重启客户端进程
         self.tokens = TokenStore(
@@ -555,12 +558,59 @@ class Frpc:
             await close_writer(writer)
 
     # ------------------------------------------------------------------
+    # 证书错误的人话翻译
+    # ------------------------------------------------------------------
+    def _explain_cert_failure(self, exc) -> None:
+        """把 OpenSSL 的英文校验失败原因，翻译成能照着做的中文步骤。
+
+        ★ 为什么值得单独写：证书错误的报文极其隐晦。用户在日志里只看到
+          "certificate is not valid for '1.2.3.4'"，既不知道是谁的错，
+          也不知道改哪里，最后往往误判成"代码坏了"或"网络不通"，
+          白白耗上几个小时。这里按最常见的三类原因分别给出处置办法。
+        """
+        msg = getattr(exc, "verify_message", "") or str(exc)
+        host = getattr(self.args, "serve_host", "?")
+        logger.error("[%s] TLS 证书校验失败：%s", self.proxy_name, msg)
+
+        low = msg.lower()
+        if ("ip address mismatch" in low or "not valid for" in low
+                or "hostname mismatch" in low or "doesn't match" in low):
+            logger.error(
+                "  原因：服务端出示的证书里，没有登记「%s」这个地址。", host)
+            logger.error(
+                "        自签证书的主机名是签发那一刻写死的。如果服务端跑在云主机上，"
+                "它看到的只是内网 IP（10.x），公网 IP 是 NAT 映射，"
+                "程序自己猜不到，于是证书里通常只写了 localhost。")
+            logger.error(
+                "  三条出路（任选其一）：\n"
+                "    1) 服务端重新生成证书，把 %s 写进证书的 SAN（最规范）；\n"
+                "    2) 客户端启动加 --no_verify_hostname：仍校验 CA，只是不比对地址；\n"
+                "    3) 仅临时排查：--insecure（连 CA 都不校验，切勿用于生产）", host)
+            logger.error("  注意：这是配置问题，重连不会自愈，需要改完再重启客户端。")
+        elif ("unable to get local issuer" in low or "self-signed" in low
+                or "unknown ca" in low or "unable to get issuer" in low):
+            logger.error(
+                "  原因：客户端不信任服务端的 CA。常见于「服务端重签过证书，"
+                "而客户端还在用旧的 ca.crt」—— 两边不是一套。")
+            logger.error(
+                "  处理：从服务端重新「导出连接包」，在客户端「导入连接包」后再试。")
+            logger.error("  注意：这是配置问题，重连不会自愈。")
+        elif "expired" in low or "not yet valid" in low:
+            logger.error("  原因：证书已过期或本机时间不准。"
+                         "服务端重启会自动续期；同时确认系统时间正确。")
+        else:
+            logger.error(
+                "  建议：确认 --ca_file 指向的 ca.crt 与服务端证书配套；"
+                "自签环境可先用 --no_verify_hostname 排除地址不匹配的可能。")
+
+    # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
     async def start(self) -> None:
         stats_task = asyncio.create_task(self._periodic_stats())
         token_task = asyncio.create_task(self._token_watch())
         attempt = 0
+        cert_failed = False
         try:
             while True:
                 try:
@@ -569,6 +619,12 @@ class Frpc:
                 except asyncio.CancelledError:
                     await self._cancel_tunnels()
                     raise
+                except ssl.SSLCertVerificationError as exc:
+                    # ★ 必须排在 OSError 之前：SSLCertVerificationError
+                    #   是 OSError 的子类，否则会被下面那个通用分支吞掉，
+                    #   用户只能看到一行英文报文，无从下手。
+                    cert_failed = True
+                    self._explain_cert_failure(exc)
                 except (ConnectionError, OSError) as exc:
                     logger.warning("[%s] 连接异常: %s", self.proxy_name, exc)
                 except Exception as exc:
@@ -578,7 +634,13 @@ class Frpc:
                 #     1) 服务端重启时，几百个客户端不要在同 1 秒齐步重连（惊群）；
                 #     2) 网络抖动时又能较快恢复（退避从小值开始）。
                 attempt += 1
-                delay = backoff_delay(attempt)
+                if cert_failed:
+                    # 证书/配置类错误不会因为"等久一点"变好。用固定短间隔，
+                    # 让用户改完证书或参数后能立刻生效，而不是干等几十秒。
+                    delay = 5.0
+                    cert_failed = False
+                else:
+                    delay = backoff_delay(attempt)
                 logger.info("[%s] %.1f 秒后重连（第 %d 次）……",
                             self.proxy_name, delay, attempt)
                 await asyncio.sleep(delay)
@@ -641,6 +703,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token_file", default="",
                         help="从文件读取 token（每行一个）；支持热重载，便于轮换")
     parser.add_argument("--ca_file", default="", help="CA 证书（校验服务端身份）")
+    parser.add_argument("--no_verify_hostname", action="store_true",
+                        help="只校验 CA、不校验证书里的主机名。"
+                             "用于服务端自签证书 + 公网 IP/NAT 访问的场景"
+                             "（服务端无法得知自己的公网 IP，证书里只能写 localhost）")
     parser.add_argument("--insecure", action="store_true",
                         help="跳过证书校验（自签证书临时测试用，勿用于生产）")
     parser.add_argument("--no_tls", action="store_true",

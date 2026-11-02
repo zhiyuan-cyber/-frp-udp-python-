@@ -163,6 +163,59 @@ def write_pem(path: str, cert, key=None, key_only: bool = False):
         os.chmod(path, 0o600)
 
 
+def load_ca(ca_cert_path: str, ca_key_path: str):
+    """读取已有的 CA 证书与私钥；任一文件缺失/损坏就返回 (None, None)。
+
+    ★ 重签服务端证书时为什么要复用 CA，而不是新建一套？
+
+      客户端手里只握着 ca.crt。如果每改一次证书主机名就新生成一个 CA，
+      所有客户端的 ca.crt 都得重新分发 —— 相当于"换个门牌号就要全楼换钥匙"。
+      而复用 CA 只换服务端证书，等于"只换身份证、人还是那个人"，
+      客户端什么都不用动。这是运维上能不能用得起来的分水岭。
+    """
+    try:
+        with open(ca_key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        with open(ca_cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+    except (OSError, ValueError, TypeError):
+        return None, None
+    if not isinstance(key, rsa.RSAPrivateKey):
+        return None, None
+    return key, cert
+
+
+def cert_san_hosts(cert_path: str) -> "list[str]":
+    """读出证书 SAN 里登记的全部地址（IP 与域名统一成字符串）。
+
+    读不出来（文件不存在、没装 cryptography）就返回空列表 ——
+    调用方据此判断"需要重签"，而不是抛异常打断启动。
+    """
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        ext = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName)
+        names = []
+        for entry in ext.value:
+            if isinstance(entry, x509.IPAddress):
+                names.append(str(entry.value))
+            elif isinstance(entry, x509.DNSName):
+                names.append(entry.value)
+        return names
+    except Exception:                       # noqa: BLE001
+        # 文件缺失、PEM 损坏、没有 SAN 扩展、未装 cryptography —— 一律当作"没有"，
+        # 让调用方走"重签"路径，而不是在启动时抛一个用户看不懂的异常。
+        return []
+
+
+def cert_covers(cert_path: str, hosts: "list[str]") -> bool:
+    """判断证书的 SAN 是否覆盖了所有要求的主机（大小写不敏感）。"""
+    have = {h.strip().lower() for h in cert_san_hosts(cert_path)}
+    need = {h.strip().lower() for h in hosts if h and h.strip()}
+    return bool(need) and need.issubset(have)
+
+
 def main():
     ap = argparse.ArgumentParser(description="生成自签 CA 与服务端证书")
     ap.add_argument("--out", default="certs", help="输出目录")

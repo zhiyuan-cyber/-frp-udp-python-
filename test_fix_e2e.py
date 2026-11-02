@@ -117,17 +117,19 @@ async def probe_forward(cert_dir, remote_port, timeout=12.0) -> bool:
     """真正的端到端证据：从外部连服务端的用户端口，走完隧道拿到回声。
 
     仅仅"注册成功"说明不了转发是否正常，必须真的收发了字节才算通。
-    ★ 用户端口是带 TLS 的（服务端用同一套证书），必须带 CA 连接；
-      用明文连会一直卡在握手，看起来像"端口没开"，极易误判。
+
+    ★ 这里必须用**明文 TCP** 连接，不能用 TLS。
+      用户端口的对端是 mstsc、浏览器这类普通客户端，它们只会按自己的协议
+      直接发包，不会先做 TLS 握手。如果测试用 TLS 去连，就会掩盖掉
+      "端口套了 TLS 导致真实客户端连不上"这类故障 —— 而那正是线上症状。
+      换句话说：这一步要用和用户完全一样的方式连接，测出来的结论才算数。
     """
-    import ssl as _ssl
-    ctx = _ssl.create_default_context(cafile=os.path.join(cert_dir, "ca.crt"))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", remote_port, ssl=ctx),
+                asyncio.open_connection("127.0.0.1", remote_port),
                 timeout=4)
             writer.write(b"hello-frp")
             await writer.drain()

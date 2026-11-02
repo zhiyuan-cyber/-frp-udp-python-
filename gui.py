@@ -2479,11 +2479,10 @@ async def _selftest() -> int:
         if server is None or not server.sessions:
             LOG.error("自检失败：客户端未能接入服务端")
         else:
-            # ★ 用户端口是带 TLS 的，这里必须用 CA 建 SSLContext ——
-            #   否则握手失败，表现是"连上了但收不到数据"，容易误判成转发坏了。
-            import ssl as _ssl
-            ctx = _ssl.create_default_context(cafile=os.path.join(cert_dir, "ca.crt"))
-            reader, writer = await asyncio.open_connection("127.0.0.1", 19001, ssl=ctx)
+            # ★ 用户端口是**明文**的（不再套 TLS）：对端是 mstsc、浏览器这类
+            #   普通 TCP 客户端，它们不会先做 TLS 握手。自检这里必须按真实
+            #   客户端的方式连接，否则测出来的"通过"和线上根本不是一回事。
+            reader, writer = await asyncio.open_connection("127.0.0.1", 19001)
             payload = b"hello-frp"
             writer.write(payload)
             await writer.drain()

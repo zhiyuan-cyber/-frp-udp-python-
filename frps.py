@@ -609,10 +609,27 @@ class Frps:
         async def handler(reader, writer):
             await self.handle_user(name, reader, writer)
 
+        # ★★ 用户端口默认**不能**套 TLS ★★
+        #
+        #   这里的对端是"任意 TCP 客户端"——mstsc、浏览器、ssh、数据库工具。
+        #   它们只会按自己的协议（RDP / HTTP / SSH）直接发包，**不会先做 TLS 握手**。
+        #   一旦这一层套上 TLS，握手在第一步就失败：客户端看到的是
+        #   "TLS 握手失败"，而 frp 的转发逻辑根本没机会执行。
+        #
+        #   控制通道（客户端 ⇄ 服务端，走 serve_port）仍然全程 TLS + token 鉴权，
+        #   那才是承载身份与指令的通道，加密不能省。
+        #   用户数据要不要加密，应交由应用协议自己负责：
+        #   RDP 自带 CredSSP/TLS，HTTPS 自带 TLS，这类场景明文转发反而是正确做法
+        #   （官方 frp 的对外端口同样不做 TLS 包装）。
+        #
+        #   确有需要时可显式 --user_tls 打开，但那样只有支持"先 TLS 后协议"
+        #   的客户端才连得上。
+        user_ssl = self.ssl_ctx if self.cfg("user_tls", False) else None
+
         try:
             server = await asyncio.start_server(
                 self._spawn(handler), host=self.cfg("user_host", "0.0.0.0"), port=port,
-                ssl=self.ssl_ctx,
+                ssl=user_ssl,
             )
         except OSError as exc:
             logger.error("[%s] 无法监听用户端口 %d: %s（可能被占用）", name, port, exc)
@@ -624,7 +641,7 @@ class Frps:
         #   改成"空转等待"，取消无副作用。
         self._user_server_tasks[name] = asyncio.create_task(self._idle_forever())
         logger.info("[%s] 用户端口已监听 %s:%d%s", name, self.cfg("user_host", "0.0.0.0"), port,
-                    " [TLS]" if self.ssl_ctx else " [明文]")
+                    " [TLS，普通客户端可能连不上]" if user_ssl else " [明文，可直接用 mstsc/浏览器等连接]")
 
     @staticmethod
     def _server_port(server: asyncio.AbstractServer) -> "int | None":
@@ -1282,6 +1299,11 @@ def parse_args() -> argparse.Namespace:
                         help="续期时写入证书的 IP/域名，可重复；不填则沿用 localhost")
     parser.add_argument("--cert_renew_days", type=int, default=30,
                         help="证书剩余少于该天数时自动续期")
+    parser.add_argument("--user_tls", action="store_true",
+                        help="对外用户端口也套一层 TLS（默认关）。"
+                             "开启后 mstsc / 浏览器 / ssh 这类普通客户端会握手失败，"
+                             "只有能「先 TLS 再发应用协议」的客户端才连得上。"
+                             "RDP、HTTPS 等本身已加密，通常不需要打开这一项")
     # 限流
     parser.add_argument("--max_conn_per_ip", type=int, default=20,
                         help="单 IP 对**单个客户端**的最大并发连接数")

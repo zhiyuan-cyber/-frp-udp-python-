@@ -907,7 +907,12 @@ class App(tk.Tk):
         _bullet(card.body, "自动生成一套自签证书（certs/）与随机 token（tokens.txt）")
         _bullet(card.body, "证书里会写入上面填的「对外访问地址」；"
                            "地址变了会自动重签（CA 不变，客户端不用换包）")
-        _bullet(card.body, "证书有效期 1 年，到期前自动续期（需 ca.key 在位）")
+        # ★ 这里原来写的是"有效期 1 年"，与 gen_cert.build_server_cert 的
+        #   默认 days=825（约 2 年 3 个月）不符，属于原版文案笔误。
+        #   有效期关系到"多久需要处理一次续期"，写错会让人误判运维节奏，
+        #   所以直接按代码里的真实值表述，并说明续期阈值。
+        _bullet(card.body, "服务端证书有效期 825 天（约 2 年 3 个月），"
+                           "剩余不足 30 天时自动续期（需 ca.key 在位）")
         _bullet(card.body, "点「导出连接包」把 ca.crt + token 打成 zip，"
                            "拷到内网机器导入即可")
 
